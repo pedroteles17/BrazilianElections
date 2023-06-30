@@ -1,0 +1,415 @@
+---
+title: "Predicting Election Results in Brazil"
+author: "Pedro Teles"
+code-annotations: hover
+toc: true
+format: 
+    html:
+        code-fold: show
+        code-summary: "Show the code"
+        code-tools: true
+        self-contained: true
+---
+
+# Introduction
+
+The objective of this project is to predict the outcomes of the 2022 Brazilian elections for the state legislative assemblies. Specifically, our focus will be on predicting the composition of each House of Representatives across all Brazilian states. 
+
+While it is also possible to predict the results for the federal legislative assembly, we have a smaller dataset for that particular scope. Therefore, we will begin by analyzing the state legislative assemblies, and the methodology outlined here can be extended to the federal level.
+
+To conduct our analysis, we will utilize election data from the years 2006, 2010, 2014, 2018, and 2022. This data has been sourced from the [basedosdados](https://basedosdados.org/) platform, which offers access to public data in a user-friendly and standardized manner.
+
+# Data
+
+```{python}
+#| output: False
+#| code-fold: true
+
+import basedosdados as bd
+import pandas as pd
+import numpy as np
+import statsmodels.api as sm
+import xgboost
+import matplotlib.pyplot as plt
+from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+
+from stargazer.stargazer import Stargazer # <1>
+from IPython.display import display, HTML
+
+import os
+from dotenv import load_dotenv
+load_dotenv() # <2>
+```
+
+1. Pretty print regression results.
+
+2. Load GCP billing project id from .env file.
+
+## Loading the data
+
+There are two methods for accessing the data. The first method involves directly reading the data from the basedosdados platform. The second method involves reading the data from a local parquet file. 
+
+The first option is more time-consuming, but it provides the most up-to-date data. On the other hand, the second option is faster, but it may not have the most recent updates. 
+
+For the purpose of this project, we will utilize the second option to avoid incurring any GCP billing charges associated with the first option. 
+
+However, if the user prefers to utilize the first option, they can simply uncomment the relevant portion of the code responsible for making calls to basedosdados.
+
+```{python}
+#| code-fold: true
+candidate_info_columns = [
+    "ano", "sigla_uf", "sequencial AS sequencial_candidato", "numero", 
+    "sigla_partido", "cargo", "situacao", "ocupacao", "idade", "genero", 
+    "instrucao", "estado_civil", "nacionalidade", "sigla_uf_nascimento", "raca"
+]
+
+election_queries = {
+    "candidate_info": """
+        SELECT  {0}
+        FROM `basedosdados.br_tse_eleicoes.candidatos` 
+        WHERE cargo = 'deputado estadual' AND ano >= 2006
+        ORDER BY ano, sequencial
+    """.format(", ".join(candidate_info_columns)),
+    "candidate_results": """
+        SELECT  ano, sigla_uf, sequencial_candidato, resultado
+        FROM `basedosdados.br_tse_eleicoes.resultados_candidato` 
+        WHERE cargo = 'deputado estadual' AND ano >= 2006
+        ORDER BY ano, sequencial_candidato
+    """,
+    "candidate_net_worth": """
+        SELECT ano, sigla_uf, sequencial_candidato, SUM(valor_item) AS bens_candidato 
+        FROM `basedosdados.br_tse_eleicoes.bens_candidato`
+        WHERE ano >= 2006 AND sequencial_candidato IN(
+            SELECT DISTINCT(sequencial) 
+            FROM `basedosdados.br_tse_eleicoes.candidatos` 
+            WHERE cargo = 'deputado estadual' AND ano >= 2006
+        )
+        GROUP BY ano, sigla_uf, sequencial_candidato
+        ORDER BY ano, sigla_uf, sequencial_candidato
+    """,
+    "campaign_contributions": """
+        SELECT ano, sigla_uf, sequencial_candidato, SUM(valor_receita) AS receitas_totais
+        FROM `basedosdados.br_tse_eleicoes.receitas_candidato`
+        WHERE cargo = 'deputado estadual' AND ano >= 2006
+        GROUP BY ano, sigla_uf, sequencial_candidato
+        ORDER BY ano, sigla_uf, sequencial_candidato
+    """,
+    "campaign_expenditure": """
+        SELECT ano, sigla_uf, sequencial_candidato, SUM(valor_despesa) AS despesas_totais
+        FROM `basedosdados.br_tse_eleicoes.despesas_candidato`
+        WHERE cargo = 'deputado estadual' AND ano >= 2006
+        GROUP BY ano, sigla_uf, sequencial_candidato
+        ORDER BY ano, sigla_uf, sequencial_candidato
+    """
+}
+
+#gcp_billing_project_id = os.getenv('GCP_BILLING_PROJECT_ID')
+
+#elections = {name: bd.read_sql(query, billing_project_id=gcp_billing_project_id) for name, query in election_queries.items()}
+```
+
+```{python}
+file_names = [
+    'candidate_info', 'candidate_results', 'candidate_net_worth', 
+    'campaign_contributions', 'campaign_expenditure'
+]
+
+elections= {}
+for file_name in file_names:
+    elections[file_name] = pd.read_parquet(f'data/{file_name}.parquet')
+```
+
+```{python}
+data = elections['candidate_info']\
+    .merge(elections['candidate_net_worth'], how='left', on=['ano', 'sigla_uf', 'sequencial_candidato'])\
+    .merge(elections['campaign_contributions'], how='left', on=['ano', 'sigla_uf', 'sequencial_candidato'])\
+    .merge(elections['campaign_expenditure'], how='left', on=['ano', 'sigla_uf', 'sequencial_candidato'])\
+    .merge(elections['candidate_results'], how='left', on=['ano', 'sigla_uf', 'sequencial_candidato'])
+```
+
+Below, we present a summary of the data.
+
+```{python}
+#| echo: false
+data.describe(include='all')
+```
+
+As we can see from the table below, there are a lot of missing values for `receitas_totais`, `bens_candidatos`, and `despesas_totais`. We got in touch with the *Tribunal Superior Eleitoral* (TSE) to understand why this is the case. They replied:
+
+> "Para fazer esse comparativo, é necessário trabalhar apenas com os registros de candidaturas aptos. Há candidatos que não declaram nem receita e nem despesa. Há candidatos que só declaram receitas. Nos anos mais recentes, esse quantitativo de candidatos que não prestam contas diminui significantemente."
+
+In english,
+
+> "To make this comparison, it is necessary to work only with eligible candidacy records. There are candidates who do not declare any contributions or expenses. There are candidates who only declare revenues. In recent years, the number of candidates who do not submit their financial reports has decreased significantly."
+
+Therefore, we will only consider candidates with eligible candidacy records. Futhermore, we will need to use models that are robust to missing values.
+
+```{python}
+#| echo: false
+data.info(null_counts=True)
+```
+
+## Data Cleaning and Feature Engineering
+
+```{python}
+data = data[data['situacao'].isin(['deferido', 'deferido com recurso'])]
+
+data['estado_civil'] = data['estado_civil']\
+    .apply(lambda x: np.nan if pd.isna(x) else (1 if x in ['casado(a)', 'viuvo(a)'] else 0))  # <1>
+
+data['genero'] = data['genero']\
+    .apply(lambda x: np.nan if pd.isna(x) else (1 if x != 'masculino' else 0)) # <2>
+
+data['instrucao'] = data['instrucao']\
+    .apply(lambda x: 
+            np.nan if pd.isna(x) else
+            1 if x == 'le e escreve' else                   # <3>
+            2 if x == 'ensino fundamental incompleto' else  # <4>
+            3 if x == 'ensino fundamental completo' else    # <5>
+            4 if x == 'ensino medio incompleto' else        # <6>
+            5 if x == 'ensino medio completo' else          # <7>
+            6 if x == 'ensino superior incompleto' else     # <8>
+            7 if x == 'ensino superior completo' else       # <9>
+            0
+         )
+
+data['local'] = (data['sigla_uf'] == data['sigla_uf_nascimento']).astype('int64') # <10>
+
+data['nacionalidade'] = data['nacionalidade']\
+    .apply(lambda x: np.nan if pd.isna(x) else (1 if x == 'brasileira' else 0)) # <11>
+
+data['raca'] = data['raca']\
+    .apply(lambda x: np.nan if pd.isna(x) else (1 if x != 'branca' else 0)) # <12>
+
+data['third_digit'] = data['numero']\
+    .apply(lambda x: str(x)[2]) # <13>
+
+data['resultado'] = data['resultado']\
+    .apply(lambda x: 1 if x in ['eleito', 'eleito por media', 'eleito por qp'] else 0) # <14>
+
+drop_cols = ['numero', 'sigla_partido', 'cargo', 'situacao', 'ocupacao', 'sigla_uf_nascimento']
+data = data.drop(columns=drop_cols)
+```
+
+1. 1 if married or widowed, 0 otherwise.
+
+2. 1 if female, 0 otherwise.
+
+3. 1 if can read and write.
+
+4. 2 if incomplete elementary school.
+
+5. 3 if complete elementary school.
+
+6. 4 if incomplete high school.
+
+7. 5 if complete high school.
+
+8. 6 if incomplete college.
+
+9. 7 if complete college.
+
+10. 1 if born in the same state as the one they are running for, 0 otherwise.
+
+11. 1 if Brazilian, 0 otherwise.
+
+12. 1 if not white, 0 otherwise.
+
+13. Third digit of the candidate's number (explanation soon).
+
+14. 1 if elected, 0 otherwise.
+
+```{python}
+#| echo: false
+data.head()
+```
+
+# Logistic Regression: A Strange Phenomenon
+
+```{python}
+#| output: False
+
+election_years = [2006, 2010, 2014, 2018, 2022]
+
+regres = []
+for year in election_years:
+    data_year = data[data['ano'] == year]
+
+    data_year = data_year.drop(columns=['receitas_totais', 'raca'])\
+        .dropna().reset_index(drop=True) # <1>
+
+    dummies = pd.get_dummies(data_year['third_digit'], prefix='third_digit', drop_first=True) # <2>
+    data_year = pd.concat([data_year, dummies], axis=1)
+
+    drop_columns = ['ano', 'sequencial_candidato', 'resultado', 'sigla_uf', 'third_digit'] # <3>
+    X = data_year.drop(columns=drop_columns)                                               # <3>
+    y = data_year['resultado']
+    
+    X = sm.add_constant(X.astype(float))
+
+    logit_model = sm.Logit(y, X)
+    result = logit_model.fit()  
+
+    regres.append(result)
+```
+
+1. `receitas_totais` is highly correlated with `despesas_totais` (multicolinearity). `raca` has a lot of missing values.
+
+2. Each third digit is encoded in a dummy variable. The first digit is dropped to avoid perfect multicolinearity.
+
+3. Drop columns that are not useful for the model. `third_digit` is dropped because it is already encoded in the dummy variables.
+
+The models presented below show a strong level of adjustment, as indicated by the pseudo $R^2$ remaining consistently around 30% throughout the elections Notably, variables such as Expenses, Civil Status, and Education demonstrate consistent and significant impact across all elections.
+
+However, an intriguing phenomenon emerges from our observations. The coefficients associated with Third Digit 1 consistently yield positive and highly significant results. This implies that candidates whose third digit is 1 possess a statistically significant higher likelihood of being elected when compared to candidates with any other digit from 0 to 9.
+
+This finding is remarkable due to its persistence across multiple elections, and its significance remains even after controlling for other variables. Furthermore, this result surpasses a mere comparison of means. It establishes that candidates with a third digit of 1 are more likely to be elected than those with a third digit of 0, 2, 3, 4, 5, 6, 7, 8, or 9.
+
+This outcome aligns with [Benford's Law](https://en.wikipedia.org/wiki/Benford%27s_law), which states that the probability of the first digit of a number being 1 is higher than the probability of it being any other digit from 2 to 9.
+
+While we cannot definitively explain the underlying cause of this phenomenon, it is highly unlikely that there exists a causal relationship between a candidate's third digit and their probability of being elected. 
+
+Our hypothesis is that candidates with greater influence within the party are more likely to be elected, and they may also tend to choose numbers with a third digit of 1. If true, the candidate's influence acts as a confounding variable in this context.
+
+```{python}
+#| code-fold: true
+
+column_order = [
+    'const', 'bens_candidato', 'despesas_totais', 'estado_civil', 'genero', 
+    'idade', 'instrucao', 'local', 'nacionalidade',  'third_digit_1',
+    'third_digit_2', 'third_digit_3', 'third_digit_4', 'third_digit_5',
+    'third_digit_6', 'third_digit_7', 'third_digit_8', 'third_digit_9'
+]
+
+new_column_names = {
+    'const': 'Constant', 'bens_candidato': 'Net Worth',
+    'despesas_totais': 'Expenses', 'estado_civil': 'Civil Status',
+    'genero': 'Gender', 'idade': 'Age', 'instrucao': 'Education',
+    'local': 'Is Local', 'nacionalidade': 'Nationality',
+    'third_digit_1': 'Third Digit 1', 'third_digit_2': 'Third Digit 2',
+    'third_digit_3': 'Third Digit 3', 'third_digit_4': 'Third Digit 4',
+    'third_digit_5': 'Third Digit 5', 'third_digit_6': 'Third Digit 6',
+    'third_digit_7': 'Third Digit 7', 'third_digit_8': 'Third Digit 8',
+    'third_digit_9': 'Third Digit 9'
+}
+
+stargazer = Stargazer(regres)
+
+stargazer.custom_columns(election_years, [1, 1, 1, 1, 1])
+stargazer.show_model_numbers(False)
+stargazer.title('Logistic Regression Results')
+stargazer.covariate_order(column_order)
+stargazer.rename_covariates(new_column_names)
+stargazer.dependent_variable_name('Elected / ')
+
+display(HTML(stargazer.render_html()))
+```
+
+# XGBoost
+
+As demonstrated earlier, our dataset contains numerous missing values. In various other domains, it is common practice to either input these missing values or discard them altogether. 
+
+However, given that our dataset pertains to election data, it is advisable to retain these missing values. It is plausible that the absence of reported information by a candidate is correlated with their socio-economic conditions. Therefore, removing these missing values outright could potentially introduce bias into our model.
+
+To address this issue, we employ the XGBoost algorithm. XGBoost is a machine learning algorithm that is capable of handling missing values natively. Futhermore, it is computationally efficient and has been shown to outperform other algorithms in a variety of domains.
+
+## Fit, Predict
+
+```{python}
+data['third_digit'] = data['third_digit']\
+    .apply(lambda x: 1 if x == '1' else 0) # <1>
+
+train = data[data['ano'] <= 2018].drop(columns=['ano', 'sequencial_candidato', 'sigla_uf'])
+test = data[data['ano'] == 2022].drop(columns=['ano', 'sequencial_candidato', 'sigla_uf'])
+
+X_train, y_train = train.drop(columns=['resultado']), train['resultado']
+X_test, y_test = test.drop(columns=['resultado']), test['resultado']
+
+xgb = xgboost.XGBClassifier()
+
+xgb.fit(X_train, y_train)
+
+y_pred = xgb.predict(X_test)
+```
+
+1. Here we only consider the "weak" form of the third digit phenomenom, i.e. whether the third digit is 1 or not.
+
+## Feature Importance
+
+```{python}
+#| code-fold: true
+
+xgboost.plot_importance(xgb, importance_type = 'gain')
+```
+
+## ROC Curve
+
+```{python}
+#| code-fold: true
+
+# Compute false positive rate, true positive rate, and thresholds
+fpr, tpr, thresholds = roc_curve(y_test, y_pred)
+
+# Compute Area Under the Curve (AUC)
+auc = roc_auc_score(y_test, y_pred)
+
+# Plot ROC curve
+plt.plot(fpr, tpr, label=f'AUC = {auc:.2f}')
+plt.plot([0, 1], [0, 1], linestyle='--', color='gray', label='Random')
+plt.xlim([0, 1])
+plt.ylim([0, 1.05])
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title('Receiver Operating Characteristic (ROC) Curve')
+plt.legend(loc='lower right')
+plt.grid(True)
+plt.show()
+```
+
+## Confusion Matrix
+
+```{python}
+#| code-fold: true
+
+cm = confusion_matrix(y_test, y_pred)
+
+class_labels = ['Class 0', 'Class 1']
+
+plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+plt.title('Confusion Matrix')
+plt.colorbar()
+tick_marks = np.arange(len(class_labels))
+plt.xticks(tick_marks, class_labels, rotation=45)
+plt.yticks(tick_marks, class_labels)
+plt.xlabel('Predicted Label')
+plt.ylabel('True Label')
+
+# Add count values in each cell
+for i in range(len(class_labels)):
+    for j in range(len(class_labels)):
+        plt.text(j, i, str(cm[i, j]), horizontalalignment='center', verticalalignment='center')
+
+plt.show()
+```
+
+## Metrics
+
+```{python}
+#| code-fold: true
+
+print(f"Acuuracy: {accuracy_score(y_test, y_pred):.2f}\n")
+
+print(f"Precision: {precision_score(y_test, y_pred):.2f}\n")
+
+print(f"Recall: {recall_score(y_test, y_pred):.2f}\n")
+
+print(f"F1 Score: {f1_score(y_test, y_pred):.2f}\n")
+```
+
+# Conclusion
+
+In this project, we discovered an interesting phenomenon: a correlation between the third digit of a candidate's number on the ballots and their likelihood of being elected.
+
+Additionally, we employed XGBoost to forecast a candidate's election prospects based on their socio-economic conditions and election data. Our model performed well, achieving an AUC score of 0.75, which represents a substantial improvement over the baseline model.
+
+Researchers can enhance this model by incorporating additional features and enhancing its complexity through techniques like hyperparameter tuning. Furthermore, this methodology can be replicated for other types of elections, such as municipal elections or federal legislative ones.
