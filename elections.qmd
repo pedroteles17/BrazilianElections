@@ -214,7 +214,7 @@ data = data.drop(columns=drop_cols)
 
 ```{python}
 #| echo: false
-data.head()
+data.describe()
 ```
 
 # Logistic Regression: A Strange Phenomenon
