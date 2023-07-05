@@ -127,13 +127,6 @@ data = elections['candidate_info']\
     .merge(elections['candidate_results'], how='left', on=['ano', 'sigla_uf', 'sequencial_candidato'])
 ```
 
-Below, we present a summary of the data.
-
-```{python}
-#| echo: false
-data.describe(include='all')
-```
-
 As we can see from the table below, there are a lot of missing values for `receitas_totais`, `bens_candidatos`, and `despesas_totais`. We got in touch with the *Tribunal Superior Eleitoral* (TSE) to understand why this is the case. They replied:
 
 > "Para fazer esse comparativo, é necessário trabalhar apenas com os registros de candidaturas aptos. Há candidatos que não declaram nem receita e nem despesa. Há candidatos que só declaram receitas. Nos anos mais recentes, esse quantitativo de candidatos que não prestam contas diminui significantemente."
