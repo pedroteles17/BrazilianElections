@@ -31,7 +31,7 @@ import numpy as np
 import statsmodels.api as sm
 import xgboost
 import matplotlib.pyplot as plt
-from sklearn.metrics import confusion_matrix, roc_curve, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import confusion_matrix, roc_curve, auc, roc_auc_score, accuracy_score, precision_score, recall_score, f1_score
 
 from stargazer.stargazer import Stargazer # <1>
 from IPython.display import display, HTML
@@ -323,9 +323,13 @@ xgb = xgboost.XGBClassifier()
 xgb.fit(X_train, y_train)
 
 y_pred = xgb.predict(X_test)
+
+y_pred_proba_positive = xgb.predict_proba(X_test)[:, 1] # <2>
 ```
 
 1. Here we only consider the "weak" form of the third digit phenomenom, i.e. whether the third digit is 1 or not.
+
+2. Predicted probabilities of being elected.
 
 ## Feature Importance
 
@@ -341,10 +345,10 @@ xgboost.plot_importance(xgb, importance_type = 'gain')
 #| code-fold: true
 
 # Compute false positive rate, true positive rate, and thresholds
-fpr, tpr, thresholds = roc_curve(y_test, y_pred)
+fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba_positive)
 
 # Compute Area Under the Curve (AUC)
-auc = roc_auc_score(y_test, y_pred)
+auc = auc(fpr, tpr)
 
 # Plot ROC curve
 plt.plot(fpr, tpr, label=f'AUC = {auc:.2f}')
