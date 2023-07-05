@@ -407,6 +407,6 @@ print(f"F1 Score: {f1_score(y_test, y_pred):.2f}\n")
 
 In this project, we discovered an interesting phenomenon: a correlation between the third digit of a candidate's number on the ballots and their likelihood of being elected.
 
-Additionally, we employed XGBoost to forecast a candidate's election prospects based on their socio-economic conditions and election data. Our model performed well, achieving an AUC score of 0.75, which represents a substantial improvement over the baseline model.
+Additionally, we employed XGBoost to forecast a candidate's election prospects based on their socio-economic conditions and election data. Our model performed reasonably well, achieving an AUC score of 0.95. However, this result may be explained by the fact that the dataset is highly imbalanced, with only 7% of candidates being elected.
 
 Researchers can enhance this model by incorporating additional features and enhancing its complexity through techniques like hyperparameter tuning. Furthermore, this methodology can be replicated for other types of elections, such as municipal elections or federal legislative ones.
